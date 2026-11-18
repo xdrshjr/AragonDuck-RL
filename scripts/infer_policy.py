@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import json
 import math
 import os
 import pickle
@@ -18,47 +19,125 @@ import mujoco
 import mujoco.viewer
 import onnxruntime as ort
 
-MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene.xml"
-# MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_ramps.xml"
-# MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_floor_objects.xml"
-# MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_robot_walk.xml"
-MICRODUCK_ROLLERS_XML = "src/mjlab_microduck/robot/microduck/scene_rollers.xml"
-MICRODUCK_BALL_XML = "src/mjlab_microduck/robot/microduck/scene_ball.xml"
+# Scene XMLs per robot. This script grew out of microduck_rl and hardcoded the
+# MicroDuck body, but the XgoDuck policies in models/ were trained against the
+# XgoDuck body. Loading the wrong body is not cosmetic: the trunks differ in
+# height (XgoDuck stands 14 mm higher on flat ground, 16 mm on the roller) and
+# the roller tires in radius (XgoDuck 15 mm vs MicroDuck 17.5 mm), so an XgoDuck
+# policy spawned on the MicroDuck robot starts from a pose it never saw and
+# falls over instead of walking.
+# Keeping both tables lets archived MicroDuck checkpoints keep working through
+# --robot microduck.
+ROBOT_SCENE_XML = {
+    "microduck": {
+        "flat": "src/mjlab_microduck/robot/microduck/scene.xml",
+        "roller": "src/mjlab_microduck/robot/microduck/scene_rollers.xml",
+        "ball": "src/mjlab_microduck/robot/microduck/scene_ball.xml",
+    },
+    "xgoduck": {
+        "flat": "src/mjlab_microduck/robot/xgoduck/scene.xml",
+        "roller": "src/mjlab_microduck/robot/xgoduck_roller/scene.xml",
+        "ball": "src/mjlab_microduck/robot/xgoduck/scene_ball.xml",
+    },
+}
+
+# Trunk z at spawn, copied from each training config's HOME frame so the policy
+# starts where it was trained: XGODUCK_STAND_Z, XGODUCK_ROLLER_STAND_Z in
+# robot/xgoduck_constants.py and robot/xgoduck_roller_constants.py.
+ROBOT_SPAWN_Z = {
+    "microduck": {"flat": 0.125, "roller": 0.1385},
+    "xgoduck": {"flat": 0.139158, "roller": 0.154817046},
+}
+
+# Motor torque constant [Nm/A], used to turn --current-limit into a force clip.
+# MicroDuck runs XL330 and reads kt from the bam package; XgoDuck runs the
+# HLS1910 whose fitted parameters ship with the robot as JSON.
+XGODUCK_PARAMS_JSON = "src/mjlab_microduck/robot/xgoduck/params/1910_m6.json"
+
+# Firmware current limit used when --current-limit is not given explicitly.
+# XL330 firmware saturates at 1.75 A (bam's dynamixel model max_current), so the
+# MicroDuck clip reproduces training. The HLS1910 has no current limit in its
+# BAM fit: the sts3215 firmware limits DUTY (max_pwm 0.97) and the torque cap
+# comes from the XML forcerange (±1.04 Nm in robot_allcollisions.xml). Clipping
+# at the XL330's 1.75 A would silently replace that cap with kt * 1.75 A
+# ≈ 1.09 Nm, a limit nothing in training used, so XgoDuck keeps its XML cap
+# unless the user asks for a clip on purpose.
+FIRMWARE_CURRENT_LIMIT = {
+    "microduck": 1.75,
+    "xgoduck": None,
+}
+
+
+def actuator_kt(robot):
+    """Return the motor torque constant [Nm/A] for `robot`'s actuators."""
+    if robot == "xgoduck":
+        with open(XGODUCK_PARAMS_JSON, encoding="utf-8") as params_file:
+            return float(json.load(params_file)["kt"])
+    from bam.model import load_model
+    return load_model(motor_name="xl330", model="m6").kt.value
+
 
 # Body pose command constants (must match training constants)
 BODY_CMD_MAX_Z = 0.03              # ±30 mm
 BODY_CMD_MAX_XY = 0.02             # ±20 mm
 BODY_CMD_MAX_ANGLE = math.radians(30)  # ±30°
 
-# Ball placement for kick behaviors (must match microduck_ball_kick_env_cfg's
-# reset_ball_in_front_of_foot params: ball center in the robot's yaw frame).
-BALL_OFFSET_X = 0.09
-BALL_OFFSET_ABS_Y = 0.042
+# Ball placement for kick behaviors (ball centre in the robot's yaw frame).
+# Per robot, because the HOME pose sets how far the toe reaches:
+# microduck_ball_kick_env_cfg's reset_ball_in_front_of_foot uses 0.09 / 0.042,
+# while xgoduck_tricks_env_cfg widens x to 0.110 so the ball keeps ~15 mm
+# clearance from the toe at the 22° XgoDuck HOME. Using the MicroDuck offset on
+# XgoDuck spawns the ball inside the foot it is supposed to kick.
+ROBOT_BALL_OFFSET = {
+    "microduck": (0.09, 0.042),
+    "xgoduck": (0.110, 0.04133),
+}
 BALL_RADIUS = 0.035
 
-# Default pose used by the policy (legs flexed, standing position)
-# This is the reference pose that:
-# - Actions are offsets from (motor_target = DEFAULT_POSE + action * scale)
-# - Joint observations are relative to (obs_joint_pos = current_pos - DEFAULT_POSE)
-# STAND2 pose (matches HOME_FRAME in microduck_constants.py): trunk shifted
-# ~5mm forward so the CoM sits over the ankle axis. Leg pitch chain leaned
-# forward vs the old pose: hip_pitch 30°→26.24°, ankle 30°→25.95°, knee 0°→0.28°.
-DEFAULT_POSE = np.array([
-    0.0,      # left_hip_yaw
-    -0.0873,  # left_hip_roll
-    -0.4579,  # left_hip_pitch
-    -0.0049,  # left_knee
-    0.4530,   # left_ankle
-    0.3491,   # neck_pitch
-    0.3491,   # head_pitch
-    0.0,      # head_yaw
-    0.0,      # head_roll
-    0.0,      # right_hip_yaw
-    0.0873,   # right_hip_roll
-    0.4579,   # right_hip_pitch
-    0.0049,   # right_knee
-    -0.4530,  # right_ankle
-], dtype=np.float32)
+# Reference pose the policy is defined around, per robot:
+#   motor_target   = pose + action * scale
+#   obs_joint_pos  = qpos - pose
+# so it must be the HOME the policy was trained against, not just "a standing
+# pose": any offset biases every joint observation AND every action target by
+# the same amount, which the policy reads as a permanent posture error.
+# microduck: HOME_FRAME in robot/microduck_constants.py (STAND2 pose).
+# xgoduck:   XGODUCK_HOME_FRAME in robot/xgoduck_constants.py (±22° hip_pitch
+#            and ankle, knee ±0.0049). Feeding an XgoDuck policy the MicroDuck
+#            pose is off by ~4° on hip_pitch and ankle.
+ROBOT_DEFAULT_POSE = {
+    "microduck": np.array([
+        0.0,      # left_hip_yaw
+        -0.0873,  # left_hip_roll
+        -0.4579,  # left_hip_pitch
+        -0.0049,  # left_knee
+        0.4530,   # left_ankle
+        0.3491,   # neck_pitch
+        0.3491,   # head_pitch
+        0.0,      # head_yaw
+        0.0,      # head_roll
+        0.0,      # right_hip_yaw
+        0.0873,   # right_hip_roll
+        0.4579,   # right_hip_pitch
+        0.0049,   # right_knee
+        -0.4530,  # right_ankle
+    ], dtype=np.float32),
+    "xgoduck": np.array([
+        0.0,        # left_hip_yaw
+        -0.0873,    # left_hip_roll
+        -0.383972,  # left_hip_pitch  (-22°)
+        -0.0049,    # left_knee
+        0.383972,   # left_ankle      (+22°)
+        0.3491,     # neck_pitch
+        0.3491,     # head_pitch
+        0.0,        # head_yaw
+        0.0,        # head_roll
+        0.0,        # right_hip_yaw
+        0.0873,     # right_hip_roll
+        0.383972,   # right_hip_pitch (+22°)
+        0.0049,     # right_knee
+        -0.383972,  # right_ankle     (-22°)
+    ], dtype=np.float32),
+}
 
 
 class TerminalInput:
@@ -138,9 +217,10 @@ class PolicyInference:
                  sitstand_onnx_path=None,
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
                  roulade_onnx_path=None,
-                 kick_duration=3.0, roulade_duration=2.0):
+                 kick_duration=3.0, roulade_duration=2.0, robot="xgoduck"):
         self.model = model
         self.data = data
+        self.robot = robot
         self.action_scale = action_scale
         self.use_projected_gravity = use_projected_gravity
         self.delay_min_lag = delay_min_lag
@@ -313,8 +393,8 @@ class PolicyInference:
             int(model.jnt_dofadr[model.actuator_trnid[i, 0]]) for i in range(model.nu)
         ]
 
-        # Default pose for the policy (flexed legs)
-        self.default_pose = DEFAULT_POSE[:self.n_joints]
+        # Default pose for the policy: the HOME of the robot it was trained on.
+        self.default_pose = ROBOT_DEFAULT_POSE[self.robot][:self.n_joints]
         print(f"Number of actuators: {self.n_joints}")
         print(f"Default pose: {self.default_pose}")
         print(f"Action scale: {self.action_scale}")
@@ -691,9 +771,10 @@ class PolicyInference:
         x, y = float(self.data.qpos[adr]), float(self.data.qpos[adr + 1])
         qw, qx, qy, qz = self.data.qpos[adr + 3:adr + 7]
         yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
-        off_y = -BALL_OFFSET_ABS_Y if behavior == "kick_right" else BALL_OFFSET_ABS_Y
-        bx = x + math.cos(yaw) * BALL_OFFSET_X - math.sin(yaw) * off_y
-        by = y + math.sin(yaw) * BALL_OFFSET_X + math.cos(yaw) * off_y
+        offset_x, offset_abs_y = ROBOT_BALL_OFFSET[self.robot]
+        off_y = -offset_abs_y if behavior == "kick_right" else offset_abs_y
+        bx = x + math.cos(yaw) * offset_x - math.sin(yaw) * off_y
+        by = y + math.sin(yaw) * offset_x + math.cos(yaw) * off_y
         self.data.qpos[self.ball_qpos_adr:self.ball_qpos_adr + 7] = [bx, by, BALL_RADIUS, 1, 0, 0, 0]
         self.data.qvel[self.ball_qvel_adr:self.ball_qvel_adr + 6] = 0.0
         foot = behavior.split("_")[1]
@@ -803,6 +884,11 @@ class PolicyInference:
 
 def main():
     parser = argparse.ArgumentParser(description="Run ONNX policy in MuJoCo")
+    parser.add_argument(
+        "--robot", choices=["xgoduck", "microduck"], default="xgoduck",
+        help="Which robot body to load for the policy (default: xgoduck, since "
+             "the checkpoints in models/ are XgoDuck). Pick microduck only for "
+             "archived MicroDuck checkpoints.")
     parser.add_argument("--roller", action="store_true", help="Use roller skate robot XML (robot_walk_rollers.xml)")
     parser.add_argument("--walking", type=str, default=None, help="Path to walking policy ONNX file")
     parser.add_argument("--standing", "-s", type=str, default=None, help="Path to standing policy ONNX file")
@@ -830,10 +916,14 @@ def main():
                         help="Use the unified 13D command obs layout (twist+head_pose+body_pose). "
                              "Required for policies trained with the new pose-command-tracking setup. "
                              "Old policies (51D obs, head_offset added to ctrl) need this flag OFF.")
-    parser.add_argument("--current-limit", type=float, default=1.75,
-                        help="XL330 firmware current limit [A]. Actuator torque is clipped to "
-                             "+/- current_limit * kt (kt from the bam package), matching the "
-                             "current saturation modeled in training. <=0 disables.")
+    parser.add_argument(
+        "--current-limit", type=float, default=None,
+        help="Firmware current limit [A]; actuator torque is clipped to "
+             "+/- current_limit * kt for that robot's motor, matching the "
+             "current saturation modeled in training. Default: 1.75 A for "
+             "--robot microduck (XL330 firmware); no clip for --robot xgoduck "
+             "(its HLS1910 fit has no current limit, so the XML forcerange "
+             "+/-1.04 Nm stands). <=0 disables.")
     parser.add_argument("--foot-friction", type=float, default=None,
                         help="Override the foot sliding friction (mu) to emulate the real grippy "
                              "PU sole. Training used mu~1.0 (range 0.7-1.3); real PU is likely "
@@ -872,30 +962,40 @@ def main():
 
     # Load MuJoCo model. Kick policies get a scene with a ball to kick.
     if args.roller:
-        xml_path = MICRODUCK_ROLLERS_XML
+        scene_kind = "roller"
     elif args.kick_left or args.kick_right:
-        xml_path = MICRODUCK_BALL_XML
+        scene_kind = "ball"
     else:
-        xml_path = MICRODUCK_XML
-    print(f"Loading MuJoCo model from: {xml_path}")
+        scene_kind = "flat"
+    xml_path = ROBOT_SCENE_XML[args.robot][scene_kind]
+    # The ball scene is the flat scene plus a ball, so it spawns at flat height.
+    spawn_kind = "roller" if scene_kind == "roller" else "flat"
+    spawn_z = ROBOT_SPAWN_Z[args.robot][spawn_kind]
+    robot_label = {"xgoduck": "XgoDuck", "microduck": "MicroDuck"}[args.robot]
+    print(f"Loading MuJoCo model from: {xml_path}  (robot: {robot_label})")
     model = mujoco.MjModel.from_xml_path(xml_path)
     model.opt.timestep = 0.005
     data = mujoco.MjData(model)
 
-    # XL330 firmware current limit. The motors saturate current at ~1.75 A; since
+    # Firmware current limit. The motors saturate current at ~1.75 A; since
     # torque = kt * current, this caps the actuator force at +/- kt * I_max. The
     # MuJoCo position actuators here are not the BAM voltage model, but clipping
     # their output force reproduces the same current saturation the policy was
-    # trained against (see BamActuator.max_current). kt comes from the bam package.
-    if args.current_limit and args.current_limit > 0:
-        from bam.model import load_model
-        kt = load_model(motor_name="xl330", model="m6").kt.value
-        torque_limit = kt * args.current_limit
+    # trained against (see BamActuator.max_current). kt is per-motor: XL330 on
+    # MicroDuck, HLS1910 on XgoDuck (see FIRMWARE_CURRENT_LIMIT).
+    current_limit = args.current_limit
+    if current_limit is None:
+        current_limit = FIRMWARE_CURRENT_LIMIT[args.robot]
+    if current_limit and current_limit > 0:
+        kt = actuator_kt(args.robot)
+        torque_limit = kt * current_limit
         model.actuator_forcerange[:, 0] = -torque_limit
         model.actuator_forcerange[:, 1] = torque_limit
         model.actuator_forcelimited[:] = 1
-        print(f"Current limit: {args.current_limit:.2f} A -> torque limit "
+        print(f"Current limit: {current_limit:.2f} A -> torque limit "
               f"+/-{torque_limit:.4f} Nm (kt={kt:.4f})")
+    else:
+        print("Current limit: none, keeping the XML actuator forcerange")
 
     # Foot contact override — emulate the real grippy + soft PU sole to check
     # whether it reproduces the on-robot forward-fall-at-speed. Training used
@@ -938,6 +1038,7 @@ def main():
         roulade_onnx_path=args.roulade,
         kick_duration=args.kick_duration,
         roulade_duration=args.roulade_duration,
+        robot=args.robot,
     )
     policy.set_vel_cmd(args.lin_vel_x, args.lin_vel_y, args.ang_vel_z)
 
@@ -969,11 +1070,19 @@ def main():
         policy.vel_max_ang = 1.5
 
     # Set initial position to default pose
-    freejoint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
+    freejoint_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
+    # mj_name2id returns -1 for a missing name, and -1 would index the LAST
+    # joint: the trunk would stay wherever the XML put it while some other
+    # joint's qpos got overwritten. Fail loudly instead.
+    if freejoint_id < 0:
+        raise SystemExit(
+            f"{xml_path} has no 'trunk_base_freejoint' joint; cannot place the "
+            f"robot at its spawn pose.")
     qpos_adr = model.jnt_qposadr[freejoint_id]
     data.qpos[qpos_adr + 0] = 0.0
     data.qpos[qpos_adr + 1] = 0.0
-    data.qpos[qpos_adr + 2] = 0.1385 if args.roller else 0.125  # rollers add 13.5mm height
+    data.qpos[qpos_adr + 2] = spawn_z
     data.qpos[qpos_adr + 3:qpos_adr + 7] = [1, 0, 0, 0]
     for i, qpos_idx in enumerate(policy.joint_qpos_indices):
         data.qpos[qpos_idx] = policy.default_pose[i]
@@ -997,7 +1106,7 @@ def main():
         print()
 
     print("\n" + "="*80)
-    print("MicroDuck Policy Inference")
+    print(f"{robot_label} Policy Inference")
     print("="*80)
     print(f"Control frequency: 50 Hz (decimation: 4)")
     print(f"Simulation timestep: {model.opt.timestep}s")
@@ -1042,9 +1151,9 @@ def main():
         original_kp = model.actuator_gainprm[:, 0].copy()
 
     # Cache the trunk freejoint qvel address so the push handler can write to
-    # the trunk's world-frame linear velocity directly (qvel[0..3]).
-    _freejoint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
-    _trunk_qvel_adr = int(model.jnt_dofadr[_freejoint_id])
+    # the trunk's world-frame linear velocity directly (qvel[0..3]). The id was
+    # already validated above, so reuse it instead of looking the name up again.
+    _trunk_qvel_adr = int(model.jnt_dofadr[freejoint_id])
     PUSH_MAX = 1.0   # matches the final velstand push_magnitude curriculum cap
 
     def random_push():
