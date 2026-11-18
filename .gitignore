@@ -17,6 +17,7 @@ AGENTS.md
 CLAUDE.md
 agents/
 .claude-index/
+.idea/
 
 # Training, evaluation, and model outputs
 logs/
