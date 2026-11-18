@@ -1040,7 +1040,6 @@ def main():
         roulade_duration=args.roulade_duration,
         robot=args.robot,
     )
-    policy.set_vel_cmd(args.lin_vel_x, args.lin_vel_y, args.ang_vel_z)
 
     # Set realistic wheel bearing friction for roller inference (must be done
     # programmatically — non-zero frictionloss in the XML breaks training)
@@ -1068,6 +1067,24 @@ def main():
         policy.vel_max_y = 0.2
         policy.vel_min_y = -0.2
         policy.vel_max_ang = 1.5
+
+    # The command range is only known now, so build the startup command from it.
+    # Passing --lin-vel-x/--ang-vel-z outside the range used to stick: the
+    # command stayed above the cap the UP/DOWN steps clamp against, so the first
+    # keypresses looked dead (roller mode also lost "no lateral command").
+    start_x, start_y, start_ang = (args.lin_vel_x, args.lin_vel_y,
+                                   args.ang_vel_z)
+    start_x = float(np.clip(start_x, policy.vel_min_x, policy.vel_max_x))
+    start_y = float(np.clip(start_y, policy.vel_min_y, policy.vel_max_y))
+    start_ang = float(np.clip(start_ang, -policy.vel_max_ang,
+                              policy.vel_max_ang))
+    if (start_x, start_y, start_ang) != (args.lin_vel_x, args.lin_vel_y,
+                                         args.ang_vel_z):
+        print("Startup command clamped to this mode's range: "
+              f"[{start_x:.2f}, {start_y:.2f}, {start_ang:.2f}] "
+              f"(asked for [{args.lin_vel_x:.2f}, {args.lin_vel_y:.2f}, "
+              f"{args.ang_vel_z:.2f}])")
+    policy.set_vel_cmd(start_x, start_y, start_ang)
 
     # Set initial position to default pose
     freejoint_id = mujoco.mj_name2id(
@@ -1185,7 +1202,13 @@ def main():
                 elif policy.body_pose_mode:
                     policy.bump_body("z", policy.body_cmd_step_z)
                 else:
-                    policy.set_vel_cmd(policy.vel_max_x, policy.vel_cmd[1], policy.vel_cmd[2])
+                    # Step, don't jump to the limit: with a jump, UP is a no-op
+                    # when the command already sits at vel_max_x (e.g. started
+                    # with --lin-vel-x at the limit) and DOWN slams straight to
+                    # full reverse, which reads as "the keys do nothing".
+                    new_x = min(policy.vel_cmd[0] + policy.vel_step_x,
+                                policy.vel_max_x)
+                    policy.set_vel_cmd(new_x, policy.vel_cmd[1], policy.vel_cmd[2])
             elif key == "down":
                 if policy.head_mode:
                     policy.head_offset[1] = np.clip(policy.head_offset[1] - policy.head_step, -policy.head_max, policy.head_max)
@@ -1194,7 +1217,9 @@ def main():
                 elif policy.body_pose_mode:
                     policy.bump_body("z", -policy.body_cmd_step_z)
                 else:
-                    policy.set_vel_cmd(policy.vel_min_x, policy.vel_cmd[1], policy.vel_cmd[2])
+                    new_x = max(policy.vel_cmd[0] - policy.vel_step_x,
+                                policy.vel_min_x)
+                    policy.set_vel_cmd(new_x, policy.vel_cmd[1], policy.vel_cmd[2])
             elif key == "right":
                 if policy.head_mode:
                     policy.head_offset[2] = np.clip(policy.head_offset[2] - policy.head_step, -policy.head_max, policy.head_max)
