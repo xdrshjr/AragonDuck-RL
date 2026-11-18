@@ -162,7 +162,20 @@ class TerminalInput:
 
     def __enter__(self):
         if not self.enabled:
-            print("WARNING: stdin is not a TTY — keyboard control disabled")
+            # Yelling is deliberate: this is silent otherwise, and a run started
+            # from an IDE Run button or piped through tee/head has no TTY, so the
+            # user presses arrow keys, sees the robot ignore them, and blames the
+            # policy instead of the launch method.
+            print()
+            print("=" * 78)
+            print("WARNING: keyboard control is DISABLED — stdin is not a terminal.")
+            print("  Arrow keys cannot reach this process. Common causes:")
+            print("    - started from an IDE Run button (PyCharm/VSCode) instead of a shell")
+            print("    - output piped or redirected:  ... | tee log.txt   /   ... > log.txt")
+            print("  Fix: run the command directly in a terminal (PowerShell / bash),")
+            print("       with no pipe, and press the keys in THAT window.")
+            print("=" * 78)
+            print()
             return self
         self._old_attrs = termios.tcgetattr(self._fd)
         tty.setcbreak(self._fd)
@@ -1320,9 +1333,10 @@ def main():
             print(f"Key press error: {e}")
 
     print("\nKeyboard controls (type in THIS terminal — the viewer window no longer captures keys):")
+    print("  Keys are read from stdin; if the line above says stdin is not a TTY they are disabled.")
     print("  [ Velocity mode (default) ]")
-    print("  UP arrow:         increase lin_vel_x (push/accelerate)")
-    print("  DOWN arrow:       decrease lin_vel_x (0=coast, negative=brake)")
+    print(f"  UP arrow:         lin_vel_x +{policy.vel_step_x:.2f} (accelerate)")
+    print(f"  DOWN arrow:       lin_vel_x -{policy.vel_step_x:.2f} (0=coast, negative=brake)")
     if args.roller:
         print("  LEFT/RIGHT arrow: turn left/right (ang_vel_z heading error)")
         print("  A / E:            turn left/right (ang_vel_z, incremental)")
