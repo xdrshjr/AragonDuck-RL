@@ -250,10 +250,13 @@ class PolicyInference:
         if walking_onnx_path:
             print(f"Loading walking policy from: {walking_onnx_path}")
             self.walking_session = ort.InferenceSession(walking_onnx_path)
-            w_input_shape = self.walking_session.get_inputs()[0].shape
-            w_output_shape = self.walking_session.get_outputs()[0].shape
-            print(f"Walking policy input: {self.walking_session.get_inputs()[0].name}, shape: {w_input_shape}")
-            print(f"Walking policy output: {self.walking_session.get_outputs()[0].name}, shape: {w_output_shape}")
+            w_input = self.walking_session.get_inputs()[0]      # 输入张量元信息（obs 向量）
+            w_output = self.walking_session.get_outputs()[0]    # 输出张量元信息（关节动作）
+            # ONNX shape 的动态维可能是字符串/None（如 ['batch', 61]），取最后一个整数维作特征维
+            w_obs_dim = next((d for d in reversed(w_input.shape) if isinstance(d, int)), None)
+            w_act_dim = next((d for d in reversed(w_output.shape) if isinstance(d, int)), None)
+            print(f"Walking policy input:  {w_input.name}, shape: {w_input.shape}")
+            print(f"Walking policy output: {w_output.name}, shape: {w_output.shape}")
 
             # Try to read gait period from ONNX metadata
             try:
@@ -1381,7 +1384,7 @@ def main():
 
         try:
             prev_step_time = time.time()
-
+            # Main
             while viewer.is_running() and not quit_requested:
                 step_start = time.time()
 
