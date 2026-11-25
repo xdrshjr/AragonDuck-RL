@@ -53,3 +53,31 @@ uv run python scripts/infer_policy.py --roller --walking models/offical/xgoduck_
 
 # 5 键盘手感自查：从 0 起步，连按上键看速度指令是否阶梯上升
 uv run python scripts/infer_policy.py --walking models/offical/xgoduck_walk.onnx --new-cmd-obs
+
+
+
+
+
+
+
+
+# Pycharm Debug
+```aiignore
+一、配 WSL 解释器（一次性）
+  Settings → Project: xgoduck_rl → Python Interpreter → Add Interpreter → On WSL
+  • Distribution：CachebackCheck（wsl -l -v 里唯一那个）
+  • User：root
+  • Interpreter 路径手填：/root/venvs/xgoduck_rl/bin/python
+  映射关系 PyCharm 自动处理，项目在 WSL 侧就是 /mnt/e/EmbodiedAI/xgoduck_rl。别让 PyCharm 去新建
+  venv，直接用现成这个（里面的依赖是全的：mujoco 3.10.0 / onnxruntime 1.24.4 / numpy 2.4.1）。
+二、建 Run/Debug Configuration
+Run → Edit Configurations → + → Python：
+字段                                                 │ 值
+──────────────────────────────────────────────────── │ ─────────────────────────────────────────────────────────────…
+Script path                                          │ `E:\EmbodiedAI\xgoduck_rl\scripts\infer_policy.py`
+Parameters                                           │ `--walking models/offical/xgoduck_walk.onnx --new-cmd-obs --l…
+Working directory                                    │ `E:\EmbodiedAI\xgoduck_rl`
+Interpreter                                          │ 上面那个 WSL 的
+（Execution 分组）Emulate terminal in output console │ **勾上**（见下）
+然后断点打在 PolicyInference.get_observations / infer / apply_action，点 Debug。
+```
